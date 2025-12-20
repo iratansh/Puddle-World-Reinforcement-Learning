@@ -5,6 +5,7 @@ from pathlib import Path
 import gymnasium as gym
 import gym_puddle
 import matplotlib.pyplot as plt
+import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.evaluation import evaluate_policy
@@ -15,10 +16,10 @@ from gymnasium.utils import seeding
 ROOT = Path(__file__).resolve().parent
 CONFIG_DIR = ROOT / "gym-puddle" / "gym_puddle" / "env_configs"
 DEFAULT_CONFIG_GLOB = "pw*.json"
-MAX_EPISODE_STEPS = 500  # Increased to give agent more time to reach goal
+MAX_EPISODE_STEPS = 500
 SEED = 100
 GAMMA = 0.99
-N_ENVS = 8  # Parallel environments for better sample diversity
+N_ENVS = 8
 TOTAL_BATCH_SIZE = 4096
 N_STEPS = TOTAL_BATCH_SIZE // N_ENVS
 BATCH_SIZE = 256
@@ -27,6 +28,7 @@ N_EPOCHS = 5
 CLIP_RANGE = 0.1
 ENT_COEF = 0.001
 TARGET_KL = 0.01
+TOTAL_TIMESTEPS = 3_000_000  # More timesteps for multi-config learning
 
 
 def plot_rewards(rewards):
@@ -91,32 +93,74 @@ def make_single_env(config_path, render_mode=None):
 
 
 class MultiConfigEnv(gym.Env):
-    def __init__(self, config_paths, render_mode=None):
+    """
+    Wrapper that randomly samples a config on each reset.
+    
+    Augments observation with a one-hot config ID so the policy knows which
+    puddle layout it's dealing with. This is CRITICAL for multi-config learning
+    because the same (x,y) position requires different actions in different configs.
+    """
+    def __init__(self, config_paths, render_mode=None, fixed_config_idx=None):
         super().__init__()
         self.config_paths = [Path(p) for p in config_paths]
         if not self.config_paths:
             raise ValueError("config_paths must include at least one config file.")
+        if fixed_config_idx is not None:
+            if fixed_config_idx < 0 or fixed_config_idx >= len(self.config_paths):
+                raise ValueError("fixed_config_idx is out of range.")
         self.render_mode = render_mode
         self._np_random, _ = seeding.np_random(None)
+        self.fixed_config_idx = fixed_config_idx
+        self.current_config_idx = 0
         self.current_config_path = None
         self._env = make_single_env(self.config_paths[0], render_mode=self.render_mode)
+        
+        # Original spaces
+        self._base_obs_space = self._env.observation_space
         self.action_space = self._env.action_space
-        self.observation_space = self._env.observation_space
+        
+        # Augmented observation: [x, y, config_onehot...]
+        # config_onehot is a one-hot vector of length len(config_paths)
+        n_configs = len(self.config_paths)
+        low = np.concatenate([self._base_obs_space.low, np.zeros(n_configs)])
+        high = np.concatenate([self._base_obs_space.high, np.ones(n_configs)])
+        self.observation_space = gym.spaces.Box(
+            low=low.astype(np.float32),
+            high=high.astype(np.float32),
+            dtype=np.float32
+        )
         self.metadata = getattr(self._env, "metadata", {})
+
+    def _augment_obs(self, obs):
+        """Add one-hot config ID to observation."""
+        one_hot = np.zeros(len(self.config_paths), dtype=np.float32)
+        one_hot[self.current_config_idx] = 1.0
+        return np.concatenate([obs.astype(np.float32), one_hot])
 
     def reset(self, seed=None, options=None):
         if seed is not None:
             self._np_random, _ = seeding.np_random(seed)
-        self.current_config_path = self._np_random.choice(self.config_paths)
+        
+        # Pick a config (fixed if provided, otherwise random)
+        if self.fixed_config_idx is None:
+            self.current_config_idx = int(
+                self._np_random.integers(len(self.config_paths))
+            )
+        else:
+            self.current_config_idx = self.fixed_config_idx
+        self.current_config_path = self.config_paths[self.current_config_idx]
+        
         if self._env is not None:
             self._env.close()
         self._env = make_single_env(
             self.current_config_path, render_mode=self.render_mode
         )
-        return self._env.reset(seed=seed, options=options)
+        obs, info = self._env.reset(seed=seed, options=options)
+        return self._augment_obs(obs), info
 
     def step(self, action):
-        return self._env.step(action)
+        obs, reward, terminated, truncated, info = self._env.step(action)
+        return self._augment_obs(obs), reward, terminated, truncated, info
 
     def render(self):
         return self._env.render()
@@ -126,17 +170,23 @@ class MultiConfigEnv(gym.Env):
             self._env.close()
 
 
-def make_env_fn(config_paths, render_mode=None):
+def make_env_fn(config_paths, render_mode=None, fixed_config_idx=None):
     def _make():
-        return Monitor(MultiConfigEnv(config_paths, render_mode=render_mode))
+        return Monitor(
+            MultiConfigEnv(
+                config_paths,
+                render_mode=render_mode,
+                fixed_config_idx=fixed_config_idx,
+            )
+        )
 
     return _make
 
 
 def evaluate_configs(model, config_paths, norm_path, n_eval_episodes):
-    for config_path in config_paths:
+    for idx, config_path in enumerate(config_paths):
         eval_env = make_vec_env(
-            make_env_fn([config_path]),
+            make_env_fn(config_paths, fixed_config_idx=idx),
             n_envs=1,
             seed=SEED + 1,
         )
@@ -168,9 +218,9 @@ def train(config_paths, eval_episodes):
     model = PPO(
         policy="MlpPolicy",
         env=vec_env,
-        # Larger network with separate value/policy networks for better value estimation
+        # Larger network for multi-config learning
         policy_kwargs=dict(
-            net_arch=dict(pi=[256, 256], vf=[256, 256]),
+            net_arch=dict(pi=[512, 512, 256], vf=[512, 512, 256]),
         ),
         gamma=GAMMA,
         gae_lambda=0.95,  # GAE for better advantage estimation
@@ -178,7 +228,7 @@ def train(config_paths, eval_episodes):
         n_steps=N_STEPS,
         batch_size=BATCH_SIZE,
         n_epochs=N_EPOCHS,
-        ent_coef=ENT_COEF,  # Entropy bonus to encourage exploration
+        ent_coef=ENT_COEF,  # Higher entropy to prevent collapse
         vf_coef=0.5,  # Value function coefficient
         max_grad_norm=0.5,  # Gradient clipping
         clip_range=CLIP_RANGE,
@@ -187,7 +237,7 @@ def train(config_paths, eval_episodes):
         verbose=1,
     )
 
-    model.learn(total_timesteps=1_000_000)  # More timesteps for convergence
+    model.learn(total_timesteps=TOTAL_TIMESTEPS)
 
     # Save model and normalization stats
     model.save("ppo_puddleWorld")
@@ -223,7 +273,7 @@ def resolve_model_path(model_path):
     )
 
 
-def play(model_path, norm_path, config_paths, episodes):
+def play(model_path, norm_path, config_paths, episodes, fixed_config_idx=None):
     model_path = resolve_model_path(model_path)
     norm_path = Path(norm_path)
     if not norm_path.exists():
@@ -232,7 +282,11 @@ def play(model_path, norm_path, config_paths, episodes):
         )
 
     eval_env = make_vec_env(
-        make_env_fn(config_paths, render_mode="human"),
+        make_env_fn(
+            config_paths,
+            render_mode="human",
+            fixed_config_idx=fixed_config_idx,
+        ),
         n_envs=1,
         seed=SEED + 1,
     )
@@ -271,6 +325,10 @@ def parse_args():
         default=[],
         help="Path to env config JSON. Repeatable. Defaults to all pw*.json configs.",
     )
+    parser.add_argument(
+        "--fixed-config",
+        help="Run a single config while keeping the full config list for observations.",
+    )
     parser.add_argument("--eval-episodes", type=int, default=20)
     return parser.parse_args()
 
@@ -278,7 +336,22 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     config_paths = resolve_config_paths(args.config)
+    fixed_config_idx = None
+    if args.fixed_config:
+        fixed_path = Path(args.fixed_config).expanduser().resolve()
+        resolved = [Path(p).resolve() for p in config_paths]
+        if fixed_path not in resolved:
+            raise ValueError(
+                f"--fixed-config {fixed_path} is not in the config list."
+            )
+        fixed_config_idx = resolved.index(fixed_path)
     if args.play:
-        play(args.model_path, args.norm_path, config_paths, args.episodes)
+        play(
+            args.model_path,
+            args.norm_path,
+            config_paths,
+            args.episodes,
+            fixed_config_idx=fixed_config_idx,
+        )
     else:
         train(config_paths, args.eval_episodes)
