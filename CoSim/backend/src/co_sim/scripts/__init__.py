@@ -1,1 +1,0 @@
-"""Executable utilities for CoSim."""
