@@ -18,17 +18,19 @@ CONFIG_DIR = ROOT / "gym-puddle" / "gym_puddle" / "env_configs"
 DEFAULT_CONFIG_GLOB = "pw*.json"
 MAX_EPISODE_STEPS = 500
 SEED = 100
-GAMMA = 0.99
+GAMMA = 0.999
 N_ENVS = 8
 TOTAL_BATCH_SIZE = 4096
-N_STEPS = TOTAL_BATCH_SIZE // N_ENVS
-BATCH_SIZE = 256
-LEARNING_RATE = 1e-4
-N_EPOCHS = 5
-CLIP_RANGE = 0.1
-ENT_COEF = 0.001
-TARGET_KL = 0.01
-TOTAL_TIMESTEPS = 3_000_000  # More timesteps for multi-config learning
+N_STEPS = 2048
+BATCH_SIZE = 64
+LEARNING_RATE = 3e-4
+N_EPOCHS = 10
+CLIP_RANGE = 0.2
+ENT_COEF = 0.05
+TARGET_KL = 0.03
+CLIP_REWARD = 100.0
+TOTAL_TIMESTEPS = 2_000_000
+SHAPING_COEF = 0.0
 
 
 def plot_rewards(rewards):
@@ -96,11 +98,23 @@ class MultiConfigEnv(gym.Env):
     """
     Wrapper that randomly samples a config on each reset.
     
-    Augments observation with a one-hot config ID so the policy knows which
-    puddle layout it's dealing with. This is CRITICAL for multi-config learning
-    because the same (x,y) position requires different actions in different configs.
+    Augments observation with puddle geometry (top-left x, top-left y, width, height)
+    for each puddle. This gives the agent the information it needs to navigate
+    different puddle layouts without memorizing config IDs.
+    
+    Observation depends on obs_mode:
+    - geometry: [x, y, goal_x, goal_y, puddle1_x, puddle1_y, puddle1_w, puddle1_h, ...]
+    - one-hot: [x, y, config_one_hot...]
+    - both: geometry + one-hot
     """
-    def __init__(self, config_paths, render_mode=None, fixed_config_idx=None):
+    def __init__(
+        self,
+        config_paths,
+        render_mode=None,
+        fixed_config_idx=None,
+        obs_mode="both",
+        shaping_coef=0.0,
+    ):
         super().__init__()
         self.config_paths = [Path(p) for p in config_paths]
         if not self.config_paths:
@@ -108,22 +122,39 @@ class MultiConfigEnv(gym.Env):
         if fixed_config_idx is not None:
             if fixed_config_idx < 0 or fixed_config_idx >= len(self.config_paths):
                 raise ValueError("fixed_config_idx is out of range.")
+        if obs_mode not in {"geometry", "one-hot", "both"}:
+            raise ValueError("obs_mode must be one of: geometry, one-hot, both.")
         self.render_mode = render_mode
         self._np_random, _ = seeding.np_random(None)
         self.fixed_config_idx = fixed_config_idx
+        self.obs_mode = obs_mode
+        self.shaping_coef = shaping_coef
         self.current_config_idx = 0
         self.current_config_path = None
+        self.current_config = None
+        self._goal = None
+        self._prev_dist = None
+        self._configs = [load_config(p) for p in self.config_paths]
+        self._max_puddles = max(
+            len(config["puddle_top_left"]) for config in self._configs
+        )
         self._env = make_single_env(self.config_paths[0], render_mode=self.render_mode)
         
         # Original spaces
         self._base_obs_space = self._env.observation_space
         self.action_space = self._env.action_space
+        self._n_configs = len(self.config_paths)
         
-        # Augmented observation: [x, y, config_onehot...]
-        # config_onehot is a one-hot vector of length len(config_paths)
-        n_configs = len(self.config_paths)
-        low = np.concatenate([self._base_obs_space.low, np.zeros(n_configs)])
-        high = np.concatenate([self._base_obs_space.high, np.ones(n_configs)])
+        # Build observation space based on obs_mode
+        extra_dims = 0
+        if self.obs_mode in {"geometry", "both"}:
+            # goal (2) + puddle info (max_puddles * 4)
+            extra_dims += 2 + self._max_puddles * 4
+        if self.obs_mode in {"one-hot", "both"}:
+            extra_dims += self._n_configs
+
+        low = np.concatenate([self._base_obs_space.low, np.zeros(extra_dims)])
+        high = np.concatenate([self._base_obs_space.high, np.ones(extra_dims)])
         self.observation_space = gym.spaces.Box(
             low=low.astype(np.float32),
             high=high.astype(np.float32),
@@ -131,11 +162,36 @@ class MultiConfigEnv(gym.Env):
         )
         self.metadata = getattr(self._env, "metadata", {})
 
+    def _goal_distance(self, obs):
+        return float(np.linalg.norm(obs - self._goal, ord=1))
+
     def _augment_obs(self, obs):
-        """Add one-hot config ID to observation."""
-        one_hot = np.zeros(len(self.config_paths), dtype=np.float32)
-        one_hot[self.current_config_idx] = 1.0
-        return np.concatenate([obs.astype(np.float32), one_hot])
+        """Add configured context to observation."""
+        parts = [obs.astype(np.float32)]
+
+        if self.obs_mode in {"geometry", "both"}:
+            config = self.current_config
+            # Goal position
+            goal = np.array(config["goal"], dtype=np.float32)
+
+            # Puddle info: [x, y, w, h] for each puddle, padded to MAX_PUDDLES
+            puddle_info = np.zeros(self._max_puddles * 4, dtype=np.float32)
+            for i, (top_left, width) in enumerate(
+                zip(config["puddle_top_left"], config["puddle_width"])
+            ):
+                if i >= self._max_puddles:
+                    break
+                puddle_info[i * 4 : i * 4 + 4] = [
+                    top_left[0], top_left[1], width[0], width[1]
+                ]
+            parts.extend([goal, puddle_info])
+
+        if self.obs_mode in {"one-hot", "both"}:
+            one_hot = np.zeros(self._n_configs, dtype=np.float32)
+            one_hot[self.current_config_idx] = 1.0
+            parts.append(one_hot)
+
+        return np.concatenate(parts)
 
     def reset(self, seed=None, options=None):
         if seed is not None:
@@ -149,6 +205,8 @@ class MultiConfigEnv(gym.Env):
         else:
             self.current_config_idx = self.fixed_config_idx
         self.current_config_path = self.config_paths[self.current_config_idx]
+        self.current_config = self._configs[self.current_config_idx]
+        self._goal = np.array(self.current_config["goal"], dtype=np.float32)
         
         if self._env is not None:
             self._env.close()
@@ -156,10 +214,15 @@ class MultiConfigEnv(gym.Env):
             self.current_config_path, render_mode=self.render_mode
         )
         obs, info = self._env.reset(seed=seed, options=options)
+        self._prev_dist = self._goal_distance(obs)
         return self._augment_obs(obs), info
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self._env.step(action)
+        if self.shaping_coef:
+            new_dist = self._goal_distance(obs)
+            reward += self.shaping_coef * (self._prev_dist - new_dist)
+            self._prev_dist = new_dist
         return self._augment_obs(obs), reward, terminated, truncated, info
 
     def render(self):
@@ -170,23 +233,33 @@ class MultiConfigEnv(gym.Env):
             self._env.close()
 
 
-def make_env_fn(config_paths, render_mode=None, fixed_config_idx=None):
+def make_env_fn(
+    config_paths,
+    render_mode=None,
+    fixed_config_idx=None,
+    obs_mode="both",
+    shaping_coef=0.0,
+):
     def _make():
         return Monitor(
             MultiConfigEnv(
                 config_paths,
                 render_mode=render_mode,
                 fixed_config_idx=fixed_config_idx,
+                obs_mode=obs_mode,
+                shaping_coef=shaping_coef,
             )
         )
 
     return _make
 
 
-def evaluate_configs(model, config_paths, norm_path, n_eval_episodes):
+def evaluate_configs(model, config_paths, norm_path, n_eval_episodes, obs_mode):
     for idx, config_path in enumerate(config_paths):
         eval_env = make_vec_env(
-            make_env_fn(config_paths, fixed_config_idx=idx),
+            make_env_fn(
+                config_paths, fixed_config_idx=idx, obs_mode=obs_mode, shaping_coef=0.0
+            ),
             n_envs=1,
             seed=SEED + 1,
         )
@@ -200,9 +273,13 @@ def evaluate_configs(model, config_paths, norm_path, n_eval_episodes):
         eval_env.close()
 
 
-def train(config_paths, eval_episodes):
+def train(config_paths, eval_episodes, obs_mode, shaping_coef):
     # Create vectorized environment with multiple parallel envs
-    vec_env = make_vec_env(make_env_fn(config_paths), n_envs=N_ENVS, seed=SEED)
+    vec_env = make_vec_env(
+        make_env_fn(config_paths, obs_mode=obs_mode, shaping_coef=shaping_coef),
+        n_envs=N_ENVS,
+        seed=SEED,
+    )
     
     # Normalize observations and rewards - CRITICAL for stable learning
     # This helps with the varying reward scales (-1 per step vs -400*dist in puddles)
@@ -211,16 +288,16 @@ def train(config_paths, eval_episodes):
         norm_obs=True,
         norm_reward=True,
         clip_obs=10.0,
-        clip_reward=10.0,
+        clip_reward=CLIP_REWARD,
         gamma=GAMMA,
     )
     
     model = PPO(
         policy="MlpPolicy",
         env=vec_env,
-        # Larger network for multi-config learning
+        # Balanced network size for multi-config learning
         policy_kwargs=dict(
-            net_arch=dict(pi=[512, 512, 256], vf=[512, 512, 256]),
+            net_arch=dict(pi=[256, 256], vf=[256, 256]),
         ),
         gamma=GAMMA,
         gae_lambda=0.95,  # GAE for better advantage estimation
@@ -245,9 +322,15 @@ def train(config_paths, eval_episodes):
 
     # Evaluation - need to use the same normalization
     if len(config_paths) > 1:
-        evaluate_configs(model, config_paths, "vec_normalize.pkl", eval_episodes)
+        evaluate_configs(
+            model, config_paths, "vec_normalize.pkl", eval_episodes, obs_mode
+        )
     else:
-        eval_env = make_vec_env(make_env_fn(config_paths), n_envs=1, seed=SEED + 1)
+        eval_env = make_vec_env(
+            make_env_fn(config_paths, obs_mode=obs_mode, shaping_coef=0.0),
+            n_envs=1,
+            seed=SEED + 1,
+        )
         eval_env = VecNormalize.load("vec_normalize.pkl", eval_env)
         eval_env.training = False  # Don't update stats during eval
         eval_env.norm_reward = False  # Use true rewards for eval
@@ -273,7 +356,14 @@ def resolve_model_path(model_path):
     )
 
 
-def play(model_path, norm_path, config_paths, episodes, fixed_config_idx=None):
+def play(
+    model_path,
+    norm_path,
+    config_paths,
+    episodes,
+    fixed_config_idx=None,
+    obs_mode="both",
+):
     model_path = resolve_model_path(model_path)
     norm_path = Path(norm_path)
     if not norm_path.exists():
@@ -286,6 +376,8 @@ def play(model_path, norm_path, config_paths, episodes, fixed_config_idx=None):
             config_paths,
             render_mode="human",
             fixed_config_idx=fixed_config_idx,
+            obs_mode=obs_mode,
+            shaping_coef=0.0,
         ),
         n_envs=1,
         seed=SEED + 1,
@@ -329,6 +421,18 @@ def parse_args():
         "--fixed-config",
         help="Run a single config while keeping the full config list for observations.",
     )
+    parser.add_argument(
+        "--obs-mode",
+        choices=["one-hot", "geometry", "both"],
+        default="both",
+        help="Observation context for multi-config training.",
+    )
+    parser.add_argument(
+        "--shaping-coef",
+        type=float,
+        default=SHAPING_COEF,
+        help="Potential-based shaping coefficient (0 disables shaping).",
+    )
     parser.add_argument("--eval-episodes", type=int, default=20)
     return parser.parse_args()
 
@@ -352,6 +456,7 @@ if __name__ == "__main__":
             config_paths,
             args.episodes,
             fixed_config_idx=fixed_config_idx,
+            obs_mode=args.obs_mode,
         )
     else:
-        train(config_paths, args.eval_episodes)
+        train(config_paths, args.eval_episodes, args.obs_mode, args.shaping_coef)
