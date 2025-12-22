@@ -16,21 +16,21 @@ from gymnasium.utils import seeding
 ROOT = Path(__file__).resolve().parent
 CONFIG_DIR = ROOT / "gym-puddle" / "gym_puddle" / "env_configs"
 DEFAULT_CONFIG_GLOB = "pw*.json"
-MAX_EPISODE_STEPS = 500
+MAX_EPISODE_STEPS = 500  # More steps for complex pw5 navigation
 SEED = 100
-GAMMA = 0.999
-N_ENVS = 8
-TOTAL_BATCH_SIZE = 4096
-N_STEPS = 2048
-BATCH_SIZE = 64
-LEARNING_RATE = 3e-4
+GAMMA = 0.99
+N_ENVS = 20  # More parallel envs for diverse experience across configs
+TOTAL_BATCH_SIZE = 10240  # Larger batches for stability
+N_STEPS = TOTAL_BATCH_SIZE // N_ENVS
+BATCH_SIZE = 512
+LEARNING_RATE = 3e-4  # Standard LR
 N_EPOCHS = 10
 CLIP_RANGE = 0.2
-ENT_COEF = 0.05
-TARGET_KL = 0.03
+ENT_COEF = 0.05  # Higher entropy for more exploration - key for finding gaps!
+TARGET_KL = None  # Disable early stopping
 CLIP_REWARD = 100.0
-TOTAL_TIMESTEPS = 2_000_000
-SHAPING_COEF = 0.0
+TOTAL_TIMESTEPS = 5_000_000  # Longer training for better generalization
+SHAPING_COEF = 1.0  # Stronger goal-seeking to overcome puddle avoidance
 
 
 def plot_rewards(rewards):
@@ -163,7 +163,28 @@ class MultiConfigEnv(gym.Env):
         self.metadata = getattr(self._env, "metadata", {})
 
     def _goal_distance(self, obs):
-        return float(np.linalg.norm(obs - self._goal, ord=1))
+        return float(np.linalg.norm(obs - self._goal, ord=2))
+    
+    def _in_puddle(self, pos):
+        """Check if position is inside any puddle and return max depth."""
+        max_depth = 0.0
+        for top_left, width in zip(
+            self.current_config["puddle_top_left"],
+            self.current_config["puddle_width"]
+        ):
+            # Puddle bounds
+            left, top = top_left[0], top_left[1]
+            right, bottom = left + width[0], top - width[1]
+            
+            # Check if inside puddle
+            if left <= pos[0] <= right and bottom <= pos[1] <= top:
+                # Distance from puddle center (normalized)
+                cx, cy = left + width[0]/2, top - width[1]/2
+                dx = abs(pos[0] - cx) / (width[0]/2 + 1e-6)
+                dy = abs(pos[1] - cy) / (width[1]/2 + 1e-6)
+                depth = 1.0 - max(dx, dy)  # 1.0 at center, 0 at edge
+                max_depth = max(max_depth, depth)
+        return max_depth
 
     def _augment_obs(self, obs):
         """Add configured context to observation."""
@@ -215,14 +236,23 @@ class MultiConfigEnv(gym.Env):
         )
         obs, info = self._env.reset(seed=seed, options=options)
         self._prev_dist = self._goal_distance(obs)
+        self._prev_obs = obs.copy()
         return self._augment_obs(obs), info
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self._env.step(action)
         if self.shaping_coef:
             new_dist = self._goal_distance(obs)
-            reward += self.shaping_coef * (self._prev_dist - new_dist)
+            # Progress shaping: reward getting closer to goal
+            # This helps guide the agent toward the goal even when avoiding puddles
+            progress_bonus = self.shaping_coef * (self._prev_dist - new_dist)
+            
+            # NO escape bonus - this was causing over-avoidance of puddles
+            # The environment's -400*dist penalty inside puddles is enough
+            
+            reward += progress_bonus
             self._prev_dist = new_dist
+            self._prev_obs = obs.copy()
         return self._augment_obs(obs), reward, terminated, truncated, info
 
     def render(self):
@@ -286,7 +316,7 @@ def train(config_paths, eval_episodes, obs_mode, shaping_coef):
     vec_env = VecNormalize(
         vec_env,
         norm_obs=True,
-        norm_reward=True,
+        norm_reward=False,
         clip_obs=10.0,
         clip_reward=CLIP_REWARD,
         gamma=GAMMA,
@@ -295,19 +325,19 @@ def train(config_paths, eval_episodes, obs_mode, shaping_coef):
     model = PPO(
         policy="MlpPolicy",
         env=vec_env,
-        # Balanced network size for multi-config learning
+        # Larger network for complex multi-config learning
         policy_kwargs=dict(
-            net_arch=dict(pi=[256, 256], vf=[256, 256]),
+            net_arch=dict(pi=[512, 256, 128], vf=[512, 256, 128]),
         ),
         gamma=GAMMA,
-        gae_lambda=0.95,  # GAE for better advantage estimation
+        gae_lambda=0.98,  # Higher GAE lambda for longer credit assignment
         learning_rate=LEARNING_RATE,
         n_steps=N_STEPS,
         batch_size=BATCH_SIZE,
         n_epochs=N_EPOCHS,
-        ent_coef=ENT_COEF,  # Higher entropy to prevent collapse
-        vf_coef=0.5,  # Value function coefficient
-        max_grad_norm=0.5,  # Gradient clipping
+        ent_coef=ENT_COEF,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
         clip_range=CLIP_RANGE,
         target_kl=TARGET_KL,
         seed=SEED,
@@ -401,12 +431,114 @@ def play(
     eval_env.close()
 
 
+def eval_all_configs(model_path, norm_path, config_paths, episodes_per_config, obs_mode, render=False):
+    """Evaluate the model on each config separately and report results."""
+    model_path = resolve_model_path(model_path)
+    norm_path = Path(norm_path)
+    if not norm_path.exists():
+        raise FileNotFoundError(
+            f"VecNormalize stats not found at {norm_path}. Train first to create it."
+        )
+
+    print(f"\n{'='*60}")
+    print(f"Evaluating model on {len(config_paths)} configurations")
+    print(f"Episodes per config: {episodes_per_config}")
+    print(f"{'='*60}\n")
+
+    all_results = {}
+    
+    for idx, config_path in enumerate(config_paths):
+        config_name = Path(config_path).name
+        render_mode = "human" if render else None
+        
+        eval_env = make_vec_env(
+            make_env_fn(
+                config_paths,
+                render_mode=render_mode,
+                fixed_config_idx=idx,
+                obs_mode=obs_mode,
+                shaping_coef=0.0,
+            ),
+            n_envs=1,
+            seed=SEED + idx,
+        )
+        eval_env = VecNormalize.load(str(norm_path), eval_env)
+        eval_env.training = False
+        eval_env.norm_reward = False
+
+        model = PPO.load(str(model_path), env=eval_env)
+        
+        episode_rewards = []
+        episode_lengths = []
+        
+        for ep in range(episodes_per_config):
+            obs = eval_env.reset()
+            done = [False]
+            episode_reward = 0.0
+            episode_length = 0
+            
+            while not done[0]:
+                action, _ = model.predict(obs, deterministic=True)
+                obs, reward, done, info = eval_env.step(action)
+                if render:
+                    eval_env.render()
+                episode_reward += float(reward[0])
+                episode_length += 1
+            
+            episode_rewards.append(episode_reward)
+            episode_lengths.append(episode_length)
+            
+            if render:
+                print(f"  Episode {ep+1}: reward={episode_reward:.2f}, steps={episode_length}")
+        
+        eval_env.close()
+        
+        mean_reward = np.mean(episode_rewards)
+        std_reward = np.std(episode_rewards)
+        mean_length = np.mean(episode_lengths)
+        
+        all_results[config_name] = {
+            'mean_reward': mean_reward,
+            'std_reward': std_reward,
+            'mean_length': mean_length,
+            'rewards': episode_rewards,
+        }
+        
+        # Determine status
+        if mean_reward > -50:
+            status = "✓ PASS"
+        elif mean_reward > -100:
+            status = "~ OK"
+        else:
+            status = "✗ FAIL"
+        
+        print(f"{config_name}: {mean_reward:7.2f} +/- {std_reward:5.2f} (avg {mean_length:.0f} steps) {status}")
+    
+    # Summary
+    print(f"\n{'='*60}")
+    print("SUMMARY")
+    print(f"{'='*60}")
+    
+    total_mean = np.mean([r['mean_reward'] for r in all_results.values()])
+    passed = sum(1 for r in all_results.values() if r['mean_reward'] > -50)
+    
+    print(f"Average reward across all configs: {total_mean:.2f}")
+    print(f"Configs with reward > -50: {passed}/{len(all_results)}")
+    
+    return all_results
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Train or render a PPO agent.")
     parser.add_argument(
         "--play",
         action="store_true",
         help="Render a trained policy instead of training.",
+    )
+    parser.add_argument(
+        "--eval",
+        action="store_true",
+        help="Evaluate the model on each config separately.",
     )
     parser.add_argument("--model-path", default="ppo_puddleWorld.zip")
     parser.add_argument("--norm-path", default="vec_normalize.pkl")
@@ -434,6 +566,11 @@ def parse_args():
         help="Potential-based shaping coefficient (0 disables shaping).",
     )
     parser.add_argument("--eval-episodes", type=int, default=20)
+    parser.add_argument(
+        "--render",
+        action="store_true",
+        help="Render during evaluation (use with --eval).",
+    )
     return parser.parse_args()
 
 
@@ -449,7 +586,17 @@ if __name__ == "__main__":
                 f"--fixed-config {fixed_path} is not in the config list."
             )
         fixed_config_idx = resolved.index(fixed_path)
-    if args.play:
+    
+    if args.eval:
+        eval_all_configs(
+            args.model_path,
+            args.norm_path,
+            config_paths,
+            args.episodes,
+            args.obs_mode,
+            render=args.render,
+        )
+    elif args.play:
         play(
             args.model_path,
             args.norm_path,
@@ -460,3 +607,9 @@ if __name__ == "__main__":
         )
     else:
         train(config_paths, args.eval_episodes, args.obs_mode, args.shaping_coef)
+
+
+
+
+
+

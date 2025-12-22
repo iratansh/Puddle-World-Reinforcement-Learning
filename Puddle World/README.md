@@ -1,23 +1,35 @@
 # Puddle World (RL)
 
-Train and evaluate a PPO agent on the `gym_puddle` Puddle World environment (Gymnasium).
+Train and evaluate a PPO agent that **generalizes across all 5 Puddle World configurations** using the `gym_puddle` Gymnasium environment.
 
-## What’s in this repo
+## Demo
 
-- `ppo.py`: PPO training + evaluation + interactive “play” mode (renders the learned policy)
+The trained agent successfully navigates all 5 environment configurations:
+
+| Config | Demo                | Reward | Steps |
+| ------ | ------------------- | ------ | ----- |
+| pw1    | ![pw1](demos/pw1.gif) | -32.00 | 33    |
+| pw2    | ![pw2](demos/pw2.gif) | -32.00 | 33    |
+| pw3    | ![pw3](demos/pw3.gif) | -24.00 | 25    |
+| pw4    | ![pw4](demos/pw4.gif) | -26.00 | 27    |
+| pw5    | ![pw5](demos/pw5.gif) | -32.00 | 33    |
+
+## What's in this repo
+
+- `ppo.py`: PPO training + evaluation + interactive "play" mode (renders the learned policy)
 - `gym-puddle/`: local Gymnasium environment package (`gym_puddle`) with multiple environment configs
 - `ppo_puddleWorld.zip`: saved PPO policy (created by training)
 - `vec_normalize.pkl`: saved `VecNormalize` stats (created by training; required for correct eval/render)
+- `demos/`: GIF recordings of the trained agent on each configuration
+- `record_demos.py`: script to generate demo GIFs
 
 ## Environment configs
 
-There are multiple Puddle World configurations in `gym-puddle/gym_puddle/env_configs/`:
+The agent is trained on all 5 Puddle World configurations in `gym-puddle/gym_puddle/env_configs/`:
 
 - `pw1.json`, `pw2.json`, `pw3.json`, `pw4.json`, `pw5.json`
 
-`ppo.py` currently uses `pw3.json` via:
-
-- `JSON_FILE = ROOT / "gym-puddle" / "gym_puddle" / "env_configs" / "pw3.json"`
+Each configuration has different puddle placements, requiring the agent to learn generalizable navigation strategies.
 
 ## Setup (conda)
 
@@ -25,14 +37,16 @@ There are multiple Puddle World configurations in `gym-puddle/gym_puddle/env_con
 conda create -n puddle-world python=3.10 -y
 conda activate puddle-world
 
-# core deps used by `ppo.py`
-pip install gymnasium==0.29.1 numpy==1.26.4 pygame==2.5.2 stable-baselines3 matplotlib
+# core deps
+pip install gymnasium==0.29.1 numpy==1.26.4 pygame==2.5.2 stable-baselines3 matplotlib pillow
 
 # install the local environment package
 pip install -e "./gym-puddle"
 ```
 
-## Train PPO
+## Training
+
+### Train PPO (multi-config)
 
 ```bash
 conda activate puddle-world
@@ -40,58 +54,87 @@ python ppo.py
 ```
 
 This produces:
+
 - `ppo_puddleWorld.zip` (trained model)
 - `vec_normalize.pkl` (normalization statistics; required for correct evaluation/rendering)
 
-### PPO hyperparameters (current)
+### PPO hyperparameters
 
-From `ppo.py`:
-- `N_ENVS=8`, `TOTAL_BATCH_SIZE=4096`, `N_STEPS=512`
-- `LEARNING_RATE=1e-4`, `N_EPOCHS=5`, `BATCH_SIZE=256`
-- `CLIP_RANGE=0.1`, `ENT_COEF=0.001`, `TARGET_KL=0.01`
-- `GAMMA=0.99`, `gae_lambda=0.95`
-- `VecNormalize` enabled for obs + reward normalization
+The agent uses the following hyperparameters for multi-config generalization:
 
-## Play / Render PPO
+| Parameter             | Value     | Description                       |
+| --------------------- | --------- | --------------------------------- |
+| `N_ENVS`            | 20        | Parallel environments             |
+| `TOTAL_TIMESTEPS`   | 5,000,000 | Total training steps              |
+| `TOTAL_BATCH_SIZE`  | 10,240    | Batch size for updates            |
+| `N_STEPS`           | 512       | Steps per env before update       |
+| `LEARNING_RATE`     | 3e-4      | Learning rate                     |
+| `N_EPOCHS`          | 10        | PPO epochs per update             |
+| `BATCH_SIZE`        | 512       | Minibatch size                    |
+| `CLIP_RANGE`        | 0.2       | PPO clip range                    |
+| `ENT_COEF`          | 0.05      | Entropy coefficient (exploration) |
+| `GAMMA`             | 0.99      | Discount factor                   |
+| `MAX_EPISODE_STEPS` | 500       | Episode timeout                   |
+
+**Key design choices:**
+
+- **Observation mode**: `"both"` - combines puddle geometry (8 dims) + one-hot config ID (5 dims)
+- **Network architecture**: `[512, 256, 128]` for both policy and value networks
+- **Goal shaping**: reward shaping based on progress toward goal (coefficient 1.0)
+- **VecNormalize**: observation normalization only (no reward normalization)
+
+## Evaluation
+
+### Evaluate on all configs
 
 ```bash
-conda activate puddle-world
+python ppo.py --eval --episodes 10
+```
+
+### Latest evaluation results
+
+| Config   | Mean Reward | Std    | Steps | Status |
+| -------- | ----------- | ------ | ----- | ------ |
+| pw1.json | -31.90      | ±1.14 | 33    | PASS   |
+| pw2.json | -32.10      | ±0.94 | 33    | PASS   |
+| pw3.json | -25.60      | ±1.56 | 27    | PASS   |
+| pw4.json | -27.90      | ±1.37 | 29    | PASS   |
+| pw5.json | -33.10      | ±1.92 | 34    | PASS   |
+
+**Average reward: -30.12 across all configs (5/5 PASS)**
+
+A reward near -30 indicates efficient paths that largely avoid puddles (environment gives -1 per step outside puddles).
+
+## Play / Render
+
+### Interactive mode
+
+```bash
 python ppo.py --play
 ```
 
-Optional args:
+### Render evaluation
 
 ```bash
-python ppo.py --play --model-path ppo_puddleWorld.zip --norm-path vec_normalize.pkl --episodes 5
+python ppo.py --eval --render --episodes 5
 ```
 
-## Results
+### Record demos
 
-### Training (latest)
+```bash
+python record_demos.py
+```
 
-Final training snapshot (SB3 logs):
-- `total_timesteps`: ~806,912+
-- `ep_rew_mean`: ~-25.8
-- `ep_len_mean`: ~26.8
-- `explained_variance`: ~0.99
-
-Interpretation: the agent reliably reaches the goal in ~27 steps; since the environment gives `-1` per step (outside puddles) and `0` at the goal, a return near `-27` indicates an efficient path that largely avoids puddles.
-
-### Evaluation (play mode)
-
-Per-episode returns (5 episodes):
-- Episode 1 reward: -24.00
-- Episode 2 reward: -25.00
-- Episode 3 reward: -25.00
-- Episode 4 reward: -25.00
-- Episode 5 reward: -25.00
+This generates GIF recordings in the `demos/` directory.
 
 ## Notes
 
-- If VS Code shows `Import "gym_puddle" could not be resolved`, select the `puddle-world` interpreter (it’s usually just an editor environment selection issue).
+- If VS Code shows `Import "gym_puddle" could not be resolved`, select the `puddle-world` interpreter
+- The agent learns a generalizable policy by observing puddle geometry, allowing it to navigate unseen puddle configurations
+- Higher entropy coefficient (0.05) encourages exploration to find gaps between puddles
 
 ## Credits
 
-This project vendors/uses the Puddle World Gymnasium environment from the original `gym-puddle` implementation by EhsanEI:
+This project uses the Puddle World Gymnasium environment from:
 
 - https://github.com/EhsanEI/gym-puddle
