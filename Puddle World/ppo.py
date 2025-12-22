@@ -1,3 +1,9 @@
+"""
+Train or render a PPO agent on multiple PuddleWorld configurations.
+Supports observation augmentation with goal and puddle geometry for generalization.
+Author: Ishaan Ratanshi
+"""
+
 import argparse
 import json
 from pathlib import Path
@@ -16,21 +22,21 @@ from gymnasium.utils import seeding
 ROOT = Path(__file__).resolve().parent
 CONFIG_DIR = ROOT / "gym-puddle" / "gym_puddle" / "env_configs"
 DEFAULT_CONFIG_GLOB = "pw*.json"
-MAX_EPISODE_STEPS = 500  # More steps for complex pw5 navigation
+MAX_EPISODE_STEPS = 500  # Longer horizon for complex pw5 navigation.
 SEED = 100
 GAMMA = 0.99
-N_ENVS = 20  # More parallel envs for diverse experience across configs
-TOTAL_BATCH_SIZE = 10240  # Larger batches for stability
+N_ENVS = 20  # More parallel envs to diversify experience across configs.
+TOTAL_BATCH_SIZE = 10240  # Larger batches to improve stability.
 N_STEPS = TOTAL_BATCH_SIZE // N_ENVS
 BATCH_SIZE = 512
-LEARNING_RATE = 3e-4  # Standard LR
+LEARNING_RATE = 3e-4  # Standard learning rate.
 N_EPOCHS = 10
 CLIP_RANGE = 0.2
-ENT_COEF = 0.05  # Higher entropy for more exploration - key for finding gaps!
-TARGET_KL = None  # Disable early stopping
+ENT_COEF = 0.05  # Higher entropy to encourage exploration.
+TARGET_KL = None  # Disable early stopping on KL.
 CLIP_REWARD = 100.0
-TOTAL_TIMESTEPS = 5_000_000  # Longer training for better generalization
-SHAPING_COEF = 1.0  # Stronger goal-seeking to overcome puddle avoidance
+TOTAL_TIMESTEPS = 5_000_000  # Longer training for better generalization.
+SHAPING_COEF = 1.0  # Stronger goal-seeking to counter puddle avoidance.
 
 
 def plot_rewards(rewards):
@@ -95,13 +101,11 @@ def make_single_env(config_path, render_mode=None):
 
 
 class MultiConfigEnv(gym.Env):
-    """
-    Wrapper that randomly samples a config on each reset.
-    
-    Augments observation with puddle geometry (top-left x, top-left y, width, height)
-    for each puddle. This gives the agent the information it needs to navigate
-    different puddle layouts without memorizing config IDs.
-    
+    """Sample a config on reset and optionally augment observations.
+
+    Augments observations with goal and puddle geometry so the agent can
+    generalize across layouts without memorizing config IDs.
+
     Observation depends on obs_mode:
     - geometry: [x, y, goal_x, goal_y, puddle1_x, puddle1_y, puddle1_w, puddle1_h, ...]
     - one-hot: [x, y, config_one_hot...]
@@ -140,15 +144,15 @@ class MultiConfigEnv(gym.Env):
         )
         self._env = make_single_env(self.config_paths[0], render_mode=self.render_mode)
         
-        # Original spaces
+        # Base spaces from the underlying env.
         self._base_obs_space = self._env.observation_space
         self.action_space = self._env.action_space
         self._n_configs = len(self.config_paths)
         
-        # Build observation space based on obs_mode
+        # Build the observation space based on obs_mode.
         extra_dims = 0
         if self.obs_mode in {"geometry", "both"}:
-            # goal (2) + puddle info (max_puddles * 4)
+            # Goal (2) + puddle info (max_puddles * 4).
             extra_dims += 2 + self._max_puddles * 4
         if self.obs_mode in {"one-hot", "both"}:
             extra_dims += self._n_configs
@@ -166,36 +170,36 @@ class MultiConfigEnv(gym.Env):
         return float(np.linalg.norm(obs - self._goal, ord=2))
     
     def _in_puddle(self, pos):
-        """Check if position is inside any puddle and return max depth."""
+        """Return the maximum puddle depth if inside any puddle."""
         max_depth = 0.0
         for top_left, width in zip(
             self.current_config["puddle_top_left"],
             self.current_config["puddle_width"]
         ):
-            # Puddle bounds
+            # Compute puddle bounds.
             left, top = top_left[0], top_left[1]
             right, bottom = left + width[0], top - width[1]
             
-            # Check if inside puddle
+            # Check whether the position is inside the puddle.
             if left <= pos[0] <= right and bottom <= pos[1] <= top:
-                # Distance from puddle center (normalized)
+                # Distance from puddle center (normalized).
                 cx, cy = left + width[0]/2, top - width[1]/2
                 dx = abs(pos[0] - cx) / (width[0]/2 + 1e-6)
                 dy = abs(pos[1] - cy) / (width[1]/2 + 1e-6)
-                depth = 1.0 - max(dx, dy)  # 1.0 at center, 0 at edge
+                depth = 1.0 - max(dx, dy)  # 1.0 at center, 0.0 at edge.
                 max_depth = max(max_depth, depth)
         return max_depth
 
     def _augment_obs(self, obs):
-        """Add configured context to observation."""
+        """Add configured context to the observation."""
         parts = [obs.astype(np.float32)]
 
         if self.obs_mode in {"geometry", "both"}:
             config = self.current_config
-            # Goal position
+            # Goal position.
             goal = np.array(config["goal"], dtype=np.float32)
 
-            # Puddle info: [x, y, w, h] for each puddle, padded to MAX_PUDDLES
+            # Puddle info: [x, y, w, h] for each puddle, padded to max count.
             puddle_info = np.zeros(self._max_puddles * 4, dtype=np.float32)
             for i, (top_left, width) in enumerate(
                 zip(config["puddle_top_left"], config["puddle_width"])
@@ -218,7 +222,7 @@ class MultiConfigEnv(gym.Env):
         if seed is not None:
             self._np_random, _ = seeding.np_random(seed)
         
-        # Pick a config (fixed if provided, otherwise random)
+        # Select a config (fixed if provided, otherwise random).
         if self.fixed_config_idx is None:
             self.current_config_idx = int(
                 self._np_random.integers(len(self.config_paths))
@@ -243,12 +247,11 @@ class MultiConfigEnv(gym.Env):
         obs, reward, terminated, truncated, info = self._env.step(action)
         if self.shaping_coef:
             new_dist = self._goal_distance(obs)
-            # Progress shaping: reward getting closer to goal
-            # This helps guide the agent toward the goal even when avoiding puddles
+            # Progress shaping: reward reductions in distance to the goal.
+            # This guides the agent even when avoiding puddles.
             progress_bonus = self.shaping_coef * (self._prev_dist - new_dist)
             
-            # NO escape bonus - this was causing over-avoidance of puddles
-            # The environment's -400*dist penalty inside puddles is enough
+            # No escape bonus; the environment's in-puddle penalty is sufficient.
             
             reward += progress_bonus
             self._prev_dist = new_dist
@@ -304,15 +307,15 @@ def evaluate_configs(model, config_paths, norm_path, n_eval_episodes, obs_mode):
 
 
 def train(config_paths, eval_episodes, obs_mode, shaping_coef):
-    # Create vectorized environment with multiple parallel envs
+    # Create a vectorized environment with multiple parallel envs.
     vec_env = make_vec_env(
         make_env_fn(config_paths, obs_mode=obs_mode, shaping_coef=shaping_coef),
         n_envs=N_ENVS,
         seed=SEED,
     )
     
-    # Normalize observations and rewards - CRITICAL for stable learning
-    # This helps with the varying reward scales (-1 per step vs -400*dist in puddles)
+    # Normalize observations (and optionally rewards) for stability.
+    # This mitigates differing reward scales (-1 per step vs. -400 * dist in puddles).
     vec_env = VecNormalize(
         vec_env,
         norm_obs=True,
@@ -325,12 +328,12 @@ def train(config_paths, eval_episodes, obs_mode, shaping_coef):
     model = PPO(
         policy="MlpPolicy",
         env=vec_env,
-        # Larger network for complex multi-config learning
+        # Larger network for multi-config learning.
         policy_kwargs=dict(
             net_arch=dict(pi=[512, 256, 128], vf=[512, 256, 128]),
         ),
         gamma=GAMMA,
-        gae_lambda=0.98,  # Higher GAE lambda for longer credit assignment
+        gae_lambda=0.98,  # Higher GAE lambda for longer credit assignment.
         learning_rate=LEARNING_RATE,
         n_steps=N_STEPS,
         batch_size=BATCH_SIZE,
@@ -346,11 +349,11 @@ def train(config_paths, eval_episodes, obs_mode, shaping_coef):
 
     model.learn(total_timesteps=TOTAL_TIMESTEPS)
 
-    # Save model and normalization stats
+    # Save the model and normalization statistics.
     model.save("ppo_puddleWorld")
     vec_env.save("vec_normalize.pkl")
 
-    # Evaluation - need to use the same normalization
+    # Evaluation requires the same normalization statistics.
     if len(config_paths) > 1:
         evaluate_configs(
             model, config_paths, "vec_normalize.pkl", eval_episodes, obs_mode
@@ -362,8 +365,8 @@ def train(config_paths, eval_episodes, obs_mode, shaping_coef):
             seed=SEED + 1,
         )
         eval_env = VecNormalize.load("vec_normalize.pkl", eval_env)
-        eval_env.training = False  # Don't update stats during eval
-        eval_env.norm_reward = False  # Use true rewards for eval
+        eval_env.training = False  # Do not update stats during eval.
+        eval_env.norm_reward = False  # Use true rewards for eval.
         mean_reward, std_reward = evaluate_policy(
             model, eval_env, n_eval_episodes=eval_episodes, deterministic=True
         )
@@ -504,17 +507,17 @@ def eval_all_configs(model_path, norm_path, config_paths, episodes_per_config, o
             'rewards': episode_rewards,
         }
         
-        # Determine status
+        # Determine status.
         if mean_reward > -50:
-            status = "✓ PASS"
+            status = "PASS"
         elif mean_reward > -100:
-            status = "~ OK"
+            status = "OK"
         else:
-            status = "✗ FAIL"
+            status = "FAIL"
         
         print(f"{config_name}: {mean_reward:7.2f} +/- {std_reward:5.2f} (avg {mean_length:.0f} steps) {status}")
     
-    # Summary
+    # Summary.
     print(f"\n{'='*60}")
     print("SUMMARY")
     print(f"{'='*60}")
@@ -607,8 +610,6 @@ if __name__ == "__main__":
         )
     else:
         train(config_paths, args.eval_episodes, args.obs_mode, args.shaping_coef)
-
-
 
 
 
